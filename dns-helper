@@ -1,0 +1,319 @@
+#!/usr/bin/env bash
+
+export DNS_HELPER_VERSION=1.0.0
+
+export DNS_HELPER_PATH="$(readlink -f "${BASH_SOURCE[0]}")"
+export DNS_HELPER_DIR="$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")"
+
+show_help() {
+    echo "DNS Helper v$DNS_HELPER_VERSION"
+    echo "Usage: dns-helper [COMMAND] [OPTIONS]"
+    echo
+    echo "COMMANDS:"
+    echo "  nameserver <domain>          Display the nameserver of a domain."
+    echo "  record <domain> <type>       Display a specific record of a domain."
+    echo "  records <domain> [<additional-records>] [options]   Display common records of a domain."
+    echo "  zone-file <domain> [<additional-records>] [options] Display records in zone file format."
+    echo "  update                       Update the script to the latest version."
+    echo "  version                      Display the script version."
+    echo
+    echo "OPTIONS:"
+    echo "  -h, --help                  Display this help message."
+    echo "  --resolver=<IP>             Specify the DNS server to use (default: 8.8.8.8)."
+    echo
+    echo "COMMAND ARGUMENTS:"
+    echo "  nameserver:"
+    echo "    <domain>                  The domain for which to display the nameserver."
+    echo
+    echo "  record:"
+    echo "    <domain>                  The domain for which to display a specific record."
+    echo "    [<type>]                  The type of record to display (e.g., A, CNAME, MX, TXT) (default: A)."
+    echo
+    echo "  records:"
+    echo "    <domain>                  The domain for which to display common records."
+    echo "    [additional-records]      Additional records to display (e.g., www:CNAME,mail:A)."
+    echo "    [options]:"
+    echo "      --include-cpanel-records Include cPanel-specific records when displaying common records."
+    echo
+    echo "  zone-file:"
+    echo "    <domain>                  The domain for which to display records in zone file format."
+    echo "    [additional-records]      Additional records to display (e.g., www:CNAME,mail:A)."
+    echo "    [options]:"
+    echo "      --include-cpanel-records Include cPanel-specific records when displaying common records."
+    echo
+    echo "Examples:"
+    echo "  dns-helper nameserver example.com"
+    echo "  dns-helper --resolver=1.1.1.1 records example.com"
+    echo "  dns-helper record example.com A"
+    echo "  dns-helper records example.com --include-cpanel-records"
+    echo "  dns-helper zone-file example.com --include-cpanel-records"
+    echo "  dns-helper update"
+    echo "  dns-helper version"
+
+    exit 0
+}
+
+
+try_get_record() {
+    local domain="$1"
+    domain="$(echo "$domain" | sed -E "s|\.$||g")"
+    local type="${2:-A}"
+    type="${type^^}"
+    local zone_file_format="$3"
+    local subdomain_data
+
+    # Get all records
+    mapfile -t subdomain_data < <(host -4 -t "$type" "$domain" "$DNS_RESOLVER" | tail -n +6 | grep -Eiv "(has no $type record|not found)")
+    for ln in "${subdomain_data[@]}"; do
+        # When a CNAME type is found, the entry is returned as "CNAME" and "A" version
+        # If the desired type is "A," the CNAME is ignored
+        if [[ "$type" == "A" ]] && echo "$ln" | grep -q "is an alias for"; then
+            continue
+        fi
+
+        local destination=""
+        if [[ "$type" == "MX" ]] && echo "$ln" | grep -q "is handled by"; then
+            # MX format
+            destination="$(echo "$ln" | awk '{print $6" "$7}')"
+        elif [[ "$type" == "CNAME" ]] && echo "$ln" | grep -q "is an alias for"; then
+            # Found a CNAME entry
+            destination="$(echo "$ln" | awk '{print $6}')"
+            echo "---- $ln"
+        elif [[ "$type" == "TXT" ]] && echo "$ln" | grep -q "descriptive text"; then
+            # TXT format
+            destination="$(echo "$ln" | awk '{$1=$2=$3=""; print $0}' | sed -E "s/(^\s*\"|\"$)//g")"
+            if [[ "$zone_file_format" == "yes" ]]; then
+                destination="\"${destination}\""
+            fi
+        elif [[ "$type" == "NS" ]] && echo "$ln" | grep -q "name server"; then
+            # Name server format
+            destination="$(echo "$ln" | awk '{print $4}')"
+        elif [[ "$type" == "A" ]] && echo "$ln" | grep -q "has address"; then
+            # Standard A format
+            destination="$(echo "$ln" | awk '{print $4}')"
+        else
+            continue
+        fi
+
+        # Remove leading and trailing spaces
+        destination="$(echo "$destination" | sed -E "s/(^\s+|\s+$)//g")"
+
+        if [[ -n "$destination" ]]; then
+            if [[ "$zone_file_format" == "yes" ]]; then
+                response="${domain}.\t1\tIN\t${type}\t${destination}"
+            else
+                response="${domain}\t${type}\t${destination}"
+            fi
+
+            echo -e "$response"
+        fi
+    done
+}
+
+show_domain_nameserver() {
+    local domain="$1"
+    domain="$(echo "$domain" | sed -E "s|\.$||g")"
+
+    if [[ -z "$domain" ]]; then
+        echo "Provide the domain." >&2
+        exit 1
+    fi
+
+    domain_ns="$(host -t ns "$domain" "$DNS_RESOLVER" | tail -n +6)"
+
+    # Couldn't obtain the domain's nameserver
+    if [[ "$domain_ns" =~ (not found\:|has no NS record) ]]; then
+        echo "Couldn't obtain the domain's nameserver." >&2
+        exit 2
+    fi
+
+    echo "$domain_ns" | awk '{print $4}' | sed -E "s|\.$||g"
+}
+
+show_records() {
+    local output_format="${1:?Provide the output format.}"
+    shift
+    local command_args=("$@")
+
+    local include_cpanel_records=""
+    extract_arg command_args "--include-cpanel-records" include_cpanel_records "yes"
+
+    local domain="${command_args[0]}"
+    domain="$(echo "$domain" | sed -E "s|\.$||g")"
+    local additional_records="${command_args[1]}"
+
+    local zone_file_format=""
+    if [[ "$output_format" == "zone-file-format" ]]; then
+        zone_file_format="yes"
+    fi
+
+    if [[ -z "$domain" ]]; then
+        echo "Provide the domain." >&2
+        exit 1
+    fi
+
+    domain_ns="$(host -t ns "$domain" "$DNS_RESOLVER" | tail -n +6)"
+    # Couldn't obtain the domain's nameserver
+    if [[ "$domain_ns" =~ (not found\:|has no NS record) ]]; then
+        return
+    fi
+
+    if [[ "$zone_file_format" == "yes" ]]; then
+        echo ";; Domain:     ${domain}."
+    else
+        echo "Name Server:"
+        echo "$domain_ns" | awk '{print $4}' | sed -E "s|\.$||g"
+        echo
+        echo "Records:"
+    fi
+
+    # Common entries
+    local records=(
+        "@:A"
+        "www:A"
+        "ftp:A"
+        "mail:A"
+        "smtp:A"
+        "pop:A"
+        "pop3:A"
+        "imap:A"
+        "webmail:A"
+        "@:MX"
+        "@:TXT"
+        "_dmarc:TXT"
+        "_domainkey:TXT"
+        "mail._domainkey:TXT"
+        "default._domainkey:TXT"
+        "_dmarc:TXT"
+   )
+
+   # cPanel entries
+   if [[ "$include_cpanel_records" == "yes" ]]; then
+       records+=(
+            "webdisk:A"
+            "cpcalendars:A"
+            "cpanel:A"
+            "whm:A"
+            "cpcontacts:A"
+            "_caldav._tcp:TXT"
+            "_caldavs._tcp:TXT"
+            "_carddav._tcp:TXT"
+            "_carddavs._tcp:TXT"
+            "_cpanel-dcv-test-record:TXT"
+       )
+   fi
+
+    if [[ -n "$additional_records" ]]; then
+        local additional_records_arr
+        IFS=',' read -ra additional_records_arr <<< "$additional_records"
+        records+=("${additional_records_arr[@]}")
+    fi
+
+    local record_name record_type
+    for record in "${records[@]}"; do
+        record_name="$(echo "$record" | awk -F ":" '{print $1}' | sed -E "s|\.$||g" | sed -E "s|@|$domain|g")"
+        record_type="$(echo "$record" | awk -F ":" '{print $2}')"
+
+        if [[ "$record_name" != "$domain" ]] && ! [[ "$record_name" =~ (\.${domain}$) ]]; then
+            record_name="${record_name}.${domain}"
+        fi
+
+        try_get_record "$record_name" "$record_type" "$zone_file_format"
+    done
+}
+
+extract_arg() {
+    local -n all_args_ref="$1"
+    local arg_name="$2"
+    local -n output_var_ref="$3"
+    local remove_if_exists="${4:-no}"
+
+    if [[ -z "$arg_name" ]]; then
+        return
+    fi
+
+    local final_args=()
+    local remove_from_args
+    for arg in "${all_args_ref[@]}"; do
+        remove_from_args=""
+
+        if [[ -n "$arg" ]]; then
+            if echo "$arg" | grep -q -E "^${arg_name}="; then
+                output_var_ref="$(echo "$arg" | sed -En "s|^${arg_name}=[\"']?(.*)[\"']?|\1|p")"
+                remove_from_args="$remove_if_exists"
+            elif echo "$arg" | grep -q -E "^${arg_name}$"; then
+                output_var_ref="yes"
+                remove_from_args="$remove_if_exists"
+            fi
+        fi
+
+        # Remove custom arguments to avoid errors when passing the command to docker
+        if [[ "$remove_from_args" != "yes" ]]; then
+            final_args+=("$arg")
+        fi
+    done
+
+    # Update the argument list
+    if [[ "${remove_if_exists,,}" == "yes" ]]; then
+        all_args_ref=("${final_args[@]}")
+    fi
+}
+
+export DNS_RESOLVER="8.8.8.8"
+export COMMAND=""
+export args=("$@")
+
+extract_arg args "--resolver" DNS_RESOLVER "yes"
+if [[ -n "${args[0]}" ]]; then
+    COMMAND="${args[0]}"
+    args=("${args[@]:1}")
+fi
+
+case "$COMMAND" in
+help|--help|-h)
+    show_help
+    ;;
+
+nameserver)
+    # Show the domain's nameserver
+    # Parameters: <domain>
+    show_domain_nameserver "${args[@]}"
+    ;;
+
+record)
+    # Show a specific record
+    # Parameters: <domain> <type(Ex: CNAME|A)>
+    try_get_record "${args[@]}"
+    ;;
+
+records)
+    # Show records commonly used by domains
+    # Parameters: <domain> [<additional-records(Ex: "www:CNAME,mail:A")>] [--include-cpanel-records]
+    show_records "plain" "${args[@]}"
+    ;;
+
+zone-file)
+    # Show records commonly used by domains in zone file format
+    # Parameters: <domain> [<additional-records(Ex: "www:CNAME,mail:A")>] [--include-cpanel-records]
+    show_records "zone-file-format" "${args[@]}"
+    ;;
+
+update)
+    # Update the script
+    curl -L "https://raw.githubusercontent.com/jhmaverick/dns-helper/master/dns-helper" -o "$DNS_HELPER_PATH"
+    chmod +x "$DNS_HELPER_PATH"
+    exit 0
+    ;;
+
+version|--version|-v)
+    # Show the script version
+    echo "Version $DOCKER_HELPER_VERSION"
+    exit 0
+    ;;
+
+*)
+    echo "Command not found"
+    echo
+    show_help
+    ;;
+esac
