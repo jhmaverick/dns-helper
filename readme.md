@@ -35,7 +35,7 @@ dns-helper record example.com A
 
 ### Display records commonly used by domains
 ```bash
-dns-helper records example.com --include-cpanel-records
+dns-helper records example.com --cpanel-records
 ```
 
 ### Display common records of a domain using a specific resolver
